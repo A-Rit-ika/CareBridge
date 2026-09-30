@@ -1,0 +1,38 @@
+import { Router } from 'express';
+import Appointment from '../models/Appointment.js';
+import Message from '../models/Message.js';
+import Notification from '../models/Notification.js';
+import Report from '../models/Report.js';
+import CarePlan from '../models/CarePlan.js';
+import EmergencyContact from '../models/EmergencyContact.js';
+import Patient from '../models/Patient.js';
+import User from '../models/User.js';
+import Checkin from '../models/Checkin.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
+import { getAccessiblePatient } from '../utils/access.js';
+
+const router = Router(); router.use(requireAuth);
+const clinicianFor = async (patientId) => Patient.findById(patientId).select('assignedClinician');
+const assertPatient = async (req, id) => getAccessiblePatient(req, id);
+
+router.get('/appointments', async (req,res,next)=>{ try { const p = req.user.role==='patient'?req.user.patient:null; const q=p?{patient:p}:{clinician:req.user.id}; res.json(await Appointment.find(q).sort({date:1}).populate('patient','name')); } catch(e){next(e)} });
+router.post('/appointments', async (req,res,next)=>{ try { const {patientId,date,type='video',title='Follow-up consultation',note=''}=req.body; const patient=await assertPatient(req, patientId || req.user.patient); if(!patient) return res.status(404).json({message:'Patient not found'}); const clinician=patient.assignedClinician; const ap=await Appointment.create({patient:patient._id,clinician,date,type,title,note}); const users=[String(clinician), ...(req.user.role==='patient'?[req.user.id]:[])]; await Promise.all(users.map(user=>Notification.create({user,title:'New appointment',body:`${title} scheduled for ${new Date(date).toLocaleString()}`,type:'appointment'}))); res.status(201).json(ap); } catch(e){next(e)} });
+router.patch('/appointments/:id', async(req,res,next)=>{ try { const ap=await Appointment.findById(req.params.id); if(!ap) return res.status(404).json({message:'Appointment not found'}); const patient=await getAccessiblePatient(req, ap.patient); if(!patient || (req.user.role==='clinician' && String(ap.clinician)!==req.user.id)) return res.status(404).json({message:'Appointment not found'}); Object.assign(ap, {status:req.body.status||ap.status,date:req.body.date||ap.date,note:req.body.note??ap.note}); await ap.save(); res.json(ap); } catch(e){next(e)} });
+
+router.get('/messages', async(req,res,next)=>{ try { const q=req.user.role==='patient'?{$or:[{sender:req.user.id},{recipient:req.user.id}]}:{$or:[{sender:req.user.id},{recipient:req.user.id}]}; res.json(await Message.find(q).sort({createdAt:1}).populate('sender','name role').populate('recipient','name role')); } catch(e){next(e)} });
+router.post('/messages', async(req,res,next)=>{ try { const {patientId,text}=req.body; if(!text?.trim()) return res.status(400).json({message:'Message cannot be empty'}); const patient=await assertPatient(req, patientId||req.user.patient); if(!patient) return res.status(404).json({message:'Patient not found'}); const recipient=req.user.role==='patient'?patient.assignedClinician:null; let to=recipient; if(req.user.role==='clinician'){ const u=await User.findOne({role:'patient',patient:patient._id}); to=u?._id; } if(!to) return res.status(404).json({message:'Recipient not found'}); const msg=await Message.create({sender:req.user.id,recipient:to,patient:patient._id,text:text.trim()}); await Notification.create({user:to,title:'New care message',body:text.trim().slice(0,120),type:'message'}); res.status(201).json(await msg.populate('sender','name role')); }catch(e){next(e)} });
+
+router.get('/notifications', async(req,res,next)=>{try{res.json(await Notification.find({user:req.user.id}).sort({createdAt:-1}).limit(50));}catch(e){next(e)}});
+router.patch('/notifications/:id/read', async(req,res,next)=>{try{const n=await Notification.findOneAndUpdate({_id:req.params.id,user:req.user.id},{readAt:new Date()},{new:true});res.json(n);}catch(e){next(e)}});
+
+router.get('/reports', async(req,res,next)=>{try{const patientId=req.user.role==='patient'?req.user.patient:req.query.patient; const patient=patientId&&await assertPatient(req,patientId); if(!patient) return res.status(404).json({message:'Patient not found'}); res.json(await Report.find({patient:patient._id}).sort({date:-1}));}catch(e){next(e)}});
+router.post('/reports', requireRole('clinician'), async(req,res,next)=>{try{const {patientId,title,type='clinical',summary='',url='',date}=req.body; const patient=await assertPatient(req,patientId);if(!patient)return res.status(404).json({message:'Patient not found'});const r=await Report.create({patient:patient._id,clinician:req.user.id,title,type,summary,url,date});const u=await User.findOne({role:'patient',patient:patient._id});if(u) await Notification.create({user:u._id,title:'New report available',body:title,type:'report'});res.status(201).json(r);}catch(e){next(e)}});
+
+router.get('/care-plan/:patientId', async(req,res,next)=>{try{const p=await assertPatient(req,req.params.patientId);if(!p)return res.status(404).json({message:'Patient not found'});let cp=await CarePlan.findOne({patient:p._id});if(!cp) cp=await CarePlan.create({patient:p._id,clinician:p.assignedClinician,goals:['Complete daily check-ins','Take medicines as prescribed'],instructions:'Follow the discharge instructions and contact your care team when an alert appears.',nextReview:p.followUpDate});res.json(cp);}catch(e){next(e)}});
+router.put('/care-plan/:patientId', requireRole('clinician'), async(req,res,next)=>{try{const p=await assertPatient(req,req.params.patientId);if(!p)return res.status(404).json({message:'Patient not found'});const cp=await CarePlan.findOneAndUpdate({patient:p._id},{clinician:req.user.id,goals:req.body.goals||[],instructions:req.body.instructions||'',nextReview:req.body.nextReview,updatedBy:req.user.id},{new:true,upsert:true});res.json(cp);}catch(e){next(e)}});
+
+router.get('/emergency', async(req,res,next)=>{try{const p=await assertPatient(req,req.user.patient || req.query.patient);if(!p)return res.status(404).json({message:'Patient not found'});let e=await EmergencyContact.findOne({patient:p._id});if(!e)e=await EmergencyContact.create({patient:p._id,contacts:[{name:p.caregiverName||'Primary caregiver',relationship:'Caregiver',phone:p.caregiverPhone||p.phone||''}]});res.json(e);}catch(e){next(e)}});
+router.put('/emergency', async(req,res,next)=>{try{const p=await assertPatient(req,req.user.patient || req.body.patientId);if(!p)return res.status(404).json({message:'Patient not found'});const e=await EmergencyContact.findOneAndUpdate({patient:p._id},{contacts:Array.isArray(req.body.contacts)?req.body.contacts:[]},{new:true,upsert:true});res.json(e);}catch(e){next(e)}});
+
+router.get('/analytics', requireRole('clinician'), async(req,res,next)=>{try{const patients=await Patient.find({assignedClinician:req.user.id}).select('_id name riskLevel lastCheckinAt');const ids=patients.map(p=>p._id);const checkins=await Checkin.find({patient:{$in:ids},takenAt:{$gte:new Date(Date.now()-30*86400000)}}).select('risk takenAt patient');const counts={green:0,amber:0,red:0};checkins.forEach(c=>counts[c.risk?.level]=(counts[c.risk?.level]||0)+1);const adherence=await Checkin.countDocuments({patient:{$in:ids},takenAt:{$gte:new Date(Date.now()-30*86400000)},medicinesTaken:true});const medTotal=await Checkin.countDocuments({patient:{$in:ids},takenAt:{$gte:new Date(Date.now()-30*86400000)},medicinesTaken:{$exists:true}});res.json({patients:patients.length,counts,checkins:checkins.length,medicationAdherence:medTotal?Math.round(adherence/medTotal*100):0});}catch(e){next(e)}});
+export default router;

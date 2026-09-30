@@ -1,0 +1,1 @@
+export default function MetricCard({label, value, unit, tone='blue', hint, icon}) { return <div className={`metric-card ${tone}`}><div className="metric-top"><span className="metric-icon">{icon}</span><span className="metric-label">{label}</span></div><div className="metric-value">{value}<small>{unit}</small></div>{hint && <div className="metric-hint">{hint}</div>}</div>; }
